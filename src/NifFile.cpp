@@ -2186,6 +2186,46 @@ NiShape* NifFile::CreateShapeFromData(const std::string& shapeName,
 		int shapeID = hdr.AddBlock(std::move(nifBSTriShape));
 		rootNode->childRefs.AddBlockRef(shapeID);
 	}
+	else if (version.IsSF()) {
+		// Starfield only renders BSGeometry; legacy NiTriShape/BSTriShape blocks in an
+		// SF-stream NIF stay invisible in-game.
+		auto bsgeoS = std::make_unique<BSGeometry>();
+		BSGeometry* bsgeo = bsgeoS.get();
+		bsgeo->name.get() = shapeName;
+		bsgeo->AddMesh();
+		bsgeo->SetInternalGeomData(true); // export's ConfigureInternalGeometry flips this as chosen
+
+		// Match vanilla SF: a zero boundMinMax box culls the shape everywhere. Vanilla ships
+		// FLT_MAX (no box-cull) and relies on the per-meshlet cull data.
+		const float fmax = std::numeric_limits<float>::max();
+		const float fmax6[6] = {fmax, fmax, fmax, fmax, fmax, fmax};
+		bsgeo->SetBoundMinMax(fmax6);
+
+		// SF materials come from the .mat path in the shader name; no texture set block
+		auto nifShader = std::make_unique<BSLightingShaderProperty>(hdr.GetVersion());
+		nifShader->SetSkinned(false);
+		bsgeo->ShaderPropertyRef()->index = hdr.AddBlock(std::move(nifShader));
+
+		shapeResult = bsgeo;
+
+		int shapeID = hdr.AddBlock(std::move(bsgeoS));
+		rootNode->childRefs.AddBlockRef(shapeID);
+
+		if (v)
+			SetVertsForShape(bsgeo, *v);
+		if (t)
+			bsgeo->SetTriangles(*t);
+		if (uv)
+			SetUvsForShape(bsgeo, *uv);
+		if (norms)
+			SetNormalsForShape(bsgeo, *norms);
+
+		// Sets the quantization scale, format version 2 and weights-per-vertex (unskinned)
+		if (auto* md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData()))
+			md->FinalizeStarfield({}, {}, 0);
+
+		bsgeo->GenerateMeshlets();
+	}
 	else {
 		auto nifTexset = std::make_unique<BSShaderTextureSet>(hdr.GetVersion());
 
@@ -2468,6 +2508,34 @@ uint32_t NifFile::GetShapeBoneList(NiShape* shape, std::vector<std::string>& out
 	return static_cast<uint32_t>(outList.size());
 }
 
+void NifFile::SetShapeSkinAttachBones(NiShape* shape, const std::vector<std::string>& boneNames) {
+	if (!shape)
+		return;
+
+	// Find an existing SkinAttach in the shape's extra data, or create and attach one.
+	SkinAttach* skinAttach = nullptr;
+	for (auto& extraDataRef : shape->extraDataRefs) {
+		auto sa = hdr.GetBlock<SkinAttach>(extraDataRef);
+		if (sa) {
+			skinAttach = sa;
+			break;
+		}
+	}
+
+	if (!skinAttach) {
+		auto sa = std::make_unique<SkinAttach>();
+		skinAttach = sa.get();
+		uint32_t id = hdr.AddBlock(std::move(sa));
+		shape->extraDataRefs.AddBlockRef(id);
+	}
+
+	// SkinAttach bone names are inline strings (stringSize 4), so no header string-table ids.
+	skinAttach->bones.clear();
+	skinAttach->bones.resize(static_cast<uint32_t>(boneNames.size()));
+	for (size_t i = 0; i < boneNames.size(); i++)
+		skinAttach->bones[static_cast<uint32_t>(i)].get() = boneNames[i];
+}
+
 uint32_t NifFile::GetShapeBoneIDList(NiShape* shape, std::vector<int>& outList) const {
 	outList.clear();
 
@@ -2490,7 +2558,10 @@ void NifFile::SetShapeBoneIDList(NiShape* shape, std::vector<int>& inList) {
 		return;
 
 	BSSkinBoneData* boneData = nullptr;
-	if (shape->HasType<BSTriShape>()) {
+	if (shape->HasType<BSTriShape>() || shape->HasType<BSGeometry>()) {
+		// Both BSTriShape and Starfield BSGeometry skin via BSSkin::Instance + BSSkin::BoneData.
+		// Fetching it here lets the feedBoneData logic below keep boneXforms sized to boneRefs,
+		// so per-bone transforms/bounds writes don't index past the end.
 		auto skinForBoneRef = hdr.GetBlock<BSSkinInstance>(shape->SkinInstanceRef());
 		if (skinForBoneRef)
 			boneData = hdr.GetBlock(skinForBoneRef->dataRef);
@@ -2882,35 +2953,31 @@ void NifFile::SetShapeVertWeights(const std::string& shapeName,
 	if (!shape)
 		return;
 
-
-	// For starfield BSGeometry, per-vertex weights live in BSGeometryMeshData::skinWeights as nWeightsPerVert pairs of {u16 boneIndex, u16 quantized weight}
-	// boneids index into shapes BSSkin::Instance boneRefs
-	if(auto* bsGeom = dynamic_cast<BSGeometry*>(shape)) {
+	// Starfield BSGeometry: per-vertex weights live in BSGeometryMeshData::skinWeights as
+	// nWeightsPerVert pairs of {u16 boneIndex, u16 quantized weight}. boneids index into the
+	// shape's BSSkin::Instance boneRefs (set via SetShapeBoneIDList).
+	if (auto* bsGeom = dynamic_cast<BSGeometry*>(shape)) {
 		auto* geomData = dynamic_cast<BSGeometryMeshData*>(bsGeom->GetGeomData());
-		if(!geomData || vertIndex >= geomData->skinWeights.size()) {
+		if (!geomData || vertIndex >= geomData->skinWeights.size())
 			return;
-		}
 
 		uint32_t wpv = geomData->nWeightsPerVert ? geomData->nWeightsPerVert : 4;
 
 		float sum = 0.0f;
-		for(auto weight : weights) {
+		for (auto weight : weights)
 			sum += weight;
-		}
-		if(sum <= 0.f) {
-			sum = 1.f;
-		}
+		if (sum <= 0.0f)
+			sum = 1.0f;
 
 		auto& vw = geomData->skinWeights[vertIndex];
 		vw.assign(wpv, BSGeometryMeshData::BoneWeight{});
 		uint32_t num = std::min<uint32_t>(static_cast<uint32_t>(weights.size()), wpv);
-		for(uint32_t i = 0; i< num; i++) {
+		for (uint32_t i = 0; i < num; i++) {
 			vw[i].boneIndex = boneids[i];
 			vw[i].weight = static_cast<uint16_t>(std::lround((weights[i] / sum) * 65535.0f));
 		}
 		return;
-	} 
-
+	}
 
 	auto bsTriShape = dynamic_cast<BSTriShape*>(shape);
 	if (!bsTriShape)
@@ -2941,17 +3008,16 @@ void NifFile::ClearShapeVertWeights(const std::string& shapeName) const {
 	if (!shape)
 		return;
 
-
-	// For Starfield BSGeometry: reset skinWeights to one zeroed nWeightsPerVert-slot entry per vertex, SetShapeVertWeights will fill them and the .mesh writer writes good weights
+	// Starfield BSGeometry: reset skinWeights to one zeroed nWeightsPerVert-slot entry per vertex
+	// so SetShapeVertWeights can fill them and the .mesh writer emits a consistent weight stream.
 	if (auto* bsGeom = dynamic_cast<BSGeometry*>(shape)) {
 		auto* geomData = dynamic_cast<BSGeometryMeshData*>(bsGeom->GetGeomData());
-		if (!geomData) {
+		if (!geomData)
 			return;
-		}
-		if (geomData->nWeightsPerVert == 0) {
+		if (geomData->nWeightsPerVert == 0)
 			geomData->nWeightsPerVert = 4;
-		}
-		geomData->skinWeights.assign(geomData->vertices.size(), std::vector<BSGeometryMeshData::BoneWeight>(geomData->nWeightsPerVert));
+		geomData->skinWeights.assign(geomData->vertices.size(),
+									 std::vector<BSGeometryMeshData::BoneWeight>(geomData->nWeightsPerVert));
 		return;
 	}
 
@@ -3232,6 +3298,11 @@ const std::vector<Color4>* NifFile::GetColorsForShape(NiShape* shape) {
 		return nullptr;
 
 	if (auto geomData = GetGeometryData(shape)) {
+		// Starfield: the file-backed colors are the byte colors in the mesh data, not the
+		// inherited raw list; unpack them so callers see what's actually in the file.
+		if (auto* sfMeshData = dynamic_cast<BSGeometryMeshData*>(geomData))
+			return &sfMeshData->UpdateRawColors();
+
 		if (geomData)
 			return &geomData->vertexColors;
 	}
@@ -3341,6 +3412,15 @@ bool NifFile::GetUvsForShape(NiShape* shape, std::vector<Vector2>& outUvs) const
 
 bool NifFile::GetColorsForShape(NiShape* shape, std::vector<Color4>& outColors) const {
 	if (auto geomData = GetGeometryData(shape)) {
+		// Starfield: colors live in the mesh data's byte color list
+		if (auto* sfMeshData = dynamic_cast<BSGeometryMeshData*>(geomData)) {
+			if (!sfMeshData->vColors.empty()) {
+				outColors = sfMeshData->UpdateRawColors();
+				return true;
+			}
+			return false;
+		}
+
 		if (geomData && geomData->HasVertexColors()) {
 			outColors = geomData->vertexColors;
 			return true;
@@ -3486,6 +3566,13 @@ void NifFile::SetColorsForShape(NiShape* shape, const std::vector<Color4>& color
 		return;
 
 	if (auto geomData = GetGeometryData(shape)) {
+		// Starfield: only the mesh data's byte color list is written to the file
+		if (auto* sfMeshData = dynamic_cast<BSGeometryMeshData*>(geomData)) {
+			if (colors.size() == sfMeshData->vertices.size())
+				sfMeshData->SetColors(colors);
+			return;
+		}
+
 		if (geomData && colors.size() == geomData->GetNumVertices()) {
 			geomData->SetVertexColors(true);
 			geomData->vertexColors = colors;
@@ -4258,6 +4345,22 @@ bool NifFile::DeleteVertsForShape(NiShape* shape, const std::vector<uint16_t>& i
 		}
 	}
 
+	// Starfield BSGeometry: the geometry lives in the selected mesh slot's BSGeometryMeshData,
+	// which is neither a NiTriBasedGeomData header block (DataRef is null) nor a BSTriShape,
+	// so neither branch above touches it. Per-vertex skin weights are inline in the mesh data;
+	// the BSSkin::Instance skin doesn't reference vertices, so no skin block update is needed.
+	auto bsGeom = dynamic_cast<BSGeometry*>(shape);
+	if (bsGeom) {
+		auto* sfMeshData = dynamic_cast<BSGeometryMeshData*>(bsGeom->GetGeomData());
+		if (sfMeshData) {
+			sfMeshData->notifyVerticesDelete(indices);
+			if (sfMeshData->vertices.empty() || sfMeshData->tris.empty()) {
+				// Deleted all verts or tris
+				allVertsDeleted = true;
+			}
+		}
+	}
+
 	auto skinInst = hdr.GetBlock<NiSkinInstance>(shape->SkinInstanceRef());
 	if (skinInst) {
 		auto skinData = hdr.GetBlock(skinInst->dataRef);
@@ -4647,6 +4750,156 @@ void NifFile::CreateSkinning(NiShape* shape) {
 	NiShader* shader = GetShader(shape);
 	if (shader)
 		shader->SetSkinned(true);
+}
+
+NiShape* NifFile::ConvertShapeToBSGeometry(NiShape* src) {
+	if (!src || src->HasType<BSGeometry>())
+		return src;
+	if (!hdr.GetVersion().IsSF())
+		return src;
+
+	// --- gather geometry from the source shape ---
+	std::vector<Vector3> verts, norms, tangents, bitangents;
+	std::vector<Triangle> tris;
+	std::vector<Vector2> uvs;
+	GetVertsForShape(src, verts);
+	src->GetTriangles(tris);
+	GetUvsForShape(src, uvs);
+	if (const std::vector<Vector3>* np = GetNormalsForShape(src))
+		norms = *np;
+	GetTangentsForShape(src, tangents);
+	GetBitangentsForShape(src, bitangents);
+	if (verts.empty())
+		return src;
+
+	// --- gather skinning from the source shape ---
+	bool skinned = src->IsSkinned();
+	std::vector<std::string> boneNames;
+	std::vector<int> boneIDs;
+	MatTransform globalToSkin;
+	bool haveGlobalToSkin = false;
+	std::vector<MatTransform> skinToBone;
+	std::vector<BoundingSphere> boneBounds;
+	std::vector<std::vector<std::pair<uint8_t, float>>> vertWeights; // per source vertex: (boneIndex, weight)
+	uint32_t maxWeightsPerVert = 0;
+	if (skinned) {
+		GetShapeBoneList(src, boneNames);
+		GetShapeBoneIDList(src, boneIDs);
+		haveGlobalToSkin = GetShapeTransformGlobalToSkin(src, globalToSkin);
+		const size_t nb = boneNames.size();
+		skinToBone.resize(nb);
+		boneBounds.resize(nb);
+		vertWeights.assign(verts.size(), {});
+		for (uint32_t bi = 0; bi < nb; bi++) {
+			GetShapeTransformSkinToBone(src, bi, skinToBone[bi]);
+			GetShapeBoneBounds(src, bi, boneBounds[bi]);
+			std::unordered_map<uint16_t, float> bw;
+			GetShapeBoneWeights(src, bi, bw);
+			for (const auto& [vid, w] : bw)
+				if (vid < vertWeights.size() && w > 0.0f)
+					vertWeights[vid].push_back({static_cast<uint8_t>(bi), w});
+		}
+		for (auto& vw : vertWeights)
+			maxWeightsPerVert = std::max(maxWeightsPerVert, static_cast<uint32_t>(vw.size()));
+		if (maxWeightsPerVert == 0)
+			maxWeightsPerVert = 1;
+	}
+
+	// --- source metadata + shared property refs ---
+	const std::string name = src->name.get();
+	const MatTransform xform = src->GetTransformToParent();
+	int shaderID = src->ShaderPropertyRef() ? src->ShaderPropertyRef()->index : NIF_NPOS;
+	int alphaID = src->AlphaPropertyRef() ? src->AlphaPropertyRef()->index : NIF_NPOS;
+	NiNode* parent = GetParentNode(src);
+
+	// --- build the BSGeometry block + geometry ---
+	auto bsgeoS = std::make_unique<BSGeometry>();
+	BSGeometry* bsgeo = bsgeoS.get();
+	bsgeo->name.get() = name;
+	bsgeo->SetTransformToParent(xform);
+	bsgeo->SetInternalGeomData(false); // export's ConfigureInternalGeometry flips this as chosen
+	bsgeo->AddMesh();
+	int newID = hdr.AddBlock(std::move(bsgeoS));
+
+	SetVertsForShape(bsgeo, verts);
+	bsgeo->SetTriangles(tris);
+	if (!uvs.empty())
+		SetUvsForShape(bsgeo, uvs);
+	if (!norms.empty())
+		SetNormalsForShape(bsgeo, norms);
+	if (auto* md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData()))
+		md->FinalizeStarfield(tangents, bitangents, skinned ? maxWeightsPerVert : 0);
+
+	// Match vanilla SF: a zero boundMinMax box culls the shape everywhere. Vanilla ships FLT_MAX
+	// (no box-cull) and relies on the per-meshlet cull data, so set the same sentinel here.
+	{
+		const float fmax = std::numeric_limits<float>::max();
+		const float fmax6[6] = {fmax, fmax, fmax, fmax, fmax, fmax};
+		bsgeo->SetBoundMinMax(fmax6);
+	}
+
+	// Carry over the shader/alpha (BSLightingShaderProperty is valid in SF). Clear the source's refs
+	// so DeleteShape below won't take the blocks we just handed to the BSGeometry.
+	if (shaderID != NIF_NPOS) {
+		bsgeo->ShaderPropertyRef()->index = shaderID;
+		src->ShaderPropertyRef()->Clear();
+	}
+	if (alphaID != NIF_NPOS) {
+		bsgeo->AlphaPropertyRef()->index = alphaID;
+		src->AlphaPropertyRef()->Clear();
+	}
+
+	if (parent)
+		parent->childRefs.AddBlockRef(newID);
+	else if (auto* root = GetRootNode())
+		root->childRefs.AddBlockRef(newID);
+
+	// --- skin: build BSSkin::Instance + BSSkin::BoneData (mirrors CreateSkinning's SF branch) ---
+	// Index-based setup (bone id list + transforms) runs before DeleteShape so the captured bone
+	// block indices are still valid; DeleteShape then fixes up the new skin instance's bone ptrs.
+	if (skinned) {
+		auto skinInstS = std::make_unique<BSSkinInstance>();
+		BSSkinInstance* skinInst = skinInstS.get();
+		int boneDataID = hdr.AddBlock(std::make_unique<BSSkinBoneData>());
+		skinInst->targetRef.index = GetBlockID(GetRootNode());
+		skinInst->dataRef.index = boneDataID;
+		int skinInstID = hdr.AddBlock(std::move(skinInstS));
+		bsgeo->SkinInstanceRef()->index = skinInstID;
+		bsgeo->SetSkinned(true);
+
+		SetShapeBoneIDList(bsgeo, boneIDs); // also sizes BSSkin::BoneData boneXforms to the bone count
+		if (haveGlobalToSkin)
+			SetShapeTransformGlobalToSkin(bsgeo, globalToSkin);
+		for (uint32_t bi = 0; bi < boneNames.size(); bi++)
+			SetShapeTransformSkinToBone(bsgeo, bi, skinToBone[bi]);
+
+		if (auto* shader = GetShader(bsgeo))
+			shader->SetSkinned(true);
+	}
+
+	// --- delete the original shape (its old skin/data blocks; shader/alpha refs already cleared) ---
+	DeleteShape(src);
+
+	// --- per-vertex weights, bone bounds, SkinAttach (name-based ops, now that 'name' is unique) ---
+	if (skinned) {
+		ClearShapeVertWeights(name); // sizes skinWeights to nWeightsPerVert slots per vertex
+		for (uint32_t vid = 0; vid < verts.size(); vid++) {
+			std::vector<uint8_t> bids;
+			std::vector<float> ws;
+			for (const auto& [b, w] : vertWeights[vid]) {
+				bids.push_back(b);
+				ws.push_back(w);
+			}
+			if (!bids.empty())
+				SetShapeVertWeights(name, static_cast<uint16_t>(vid), bids, ws);
+		}
+		for (uint32_t bi = 0; bi < boneBounds.size(); bi++)
+			SetShapeBoneBounds(name, bi, boneBounds[bi]);
+		SetShapeSkinAttachBones(bsgeo, boneNames);
+	}
+
+	bsgeo->GenerateMeshlets();
+	return bsgeo;
 }
 
 void NifFile::SetShapeDynamic(const std::string& shapeName) {

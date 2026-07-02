@@ -311,6 +311,14 @@ public:
 								 const std::vector<Vector2>* uv,
 								 const std::vector<Vector3>* norms = nullptr);
 
+	// Converts a non-Starfield shape (e.g. a Skyrim/FO BSTriShape) into a Starfield BSGeometry in
+	// this (SF-versioned) file, in place: copies geometry (verts/tris/UVs/normals/tangents), rebuilds
+	// the skin as BSSkin::Instance + BSSkin::BoneData + SkinAttach from the source skinning, carries
+	// over the shader/alpha properties, generates meshlets, and deletes the original shape. Returns
+	// the new BSGeometry (or the input unchanged if it is already a BSGeometry / the file isn't SF).
+	// Note: skin weights/bones are carried as-is — porting a foreign skeleton still needs reskinning.
+	NiShape* ConvertShapeToBSGeometry(NiShape* shape);
+
 	// Returns the names of all shape blocks in the file. Includes duplicates and unnamed shapes.
 	std::vector<std::string> GetShapeNames() const;
 
@@ -374,6 +382,11 @@ public:
 
 	// Gets a list of all bone (node) block indices used by the shape and returns the count.
 	uint32_t GetShapeBoneIDList(NiShape* shape, std::vector<int>& outList) const;
+
+	// Starfield: sets (creating if needed) the shape's SkinAttach extra-data bone-name list.
+	// Order must match the shape's per-vertex skinWeights bone indices, since SF resolves
+	// weight bone indices through these names (boneRefs are None).
+	void SetShapeSkinAttachBones(NiShape* shape, const std::vector<std::string>& boneNames);
 
 	// Sets the bone index list of the shape's skin instance (and BSSkin::BoneData).
 	// Resets bone transforms in BSSkin::BoneData if the bone count changed.

@@ -12,8 +12,10 @@ See the included GPLv3 LICENSE file
 #include "NifUtil.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <unordered_set>
 
 using namespace nifly;
 
@@ -1611,12 +1613,32 @@ void BSGeometryMeshData::Sync(NiStreamReversible& stream) {
 		nColors = static_cast<uint32_t>(vColors.size());
 		nNormals = static_cast<uint32_t>(normals.size());
 		nTangents = static_cast<uint32_t>(tangents.size());
+		// Tangents can be (re)assigned without their handedness list (e.g. via SetTangentsForShape);
+		// the write loop below indexes tangentWs per tangent, so keep it sized. Default W = 1.
+		tangentWs.resize(tangents.size(), 1);
 		nTotalWeights = 0;
 		for (auto& vw : skinWeights)
 			nTotalWeights += static_cast<uint32_t>(vw.size());
 		nLODS = static_cast<uint32_t>(lods.size());
 		nMeshlets = static_cast<uint32_t>(meshletList.size());
 		nCullData = static_cast<uint32_t>(cullDataList.size());
+
+		// Positions are packed as round(component / (scale*havokScale) * 32767) into an int16.
+		// If an edit moved a vertex past the extent the loaded scale was sized for, that packing
+		// overflows the int16 and the vertex decodes to a garbage position (exploded mesh). Grow
+		// scale to cover the current extent; never shrink it, so a mesh whose verts already fit
+		// re-serializes byte-identically (load->save round-trip stability is preserved).
+		float maxAbs = 0.0f;
+		for (auto& v : vertices) {
+			maxAbs = std::max(maxAbs, std::fabs(v.x));
+			maxAbs = std::max(maxAbs, std::fabs(v.y));
+			maxAbs = std::max(maxAbs, std::fabs(v.z));
+		}
+		float requiredScale = maxAbs / havokScale;
+		if (scale < requiredScale)
+			scale = requiredScale * 1.0001f; // small margin, matching FinalizeStarfield
+		if (scale < 1.0e-4f && !vertices.empty())
+			scale = 1.0f;
 	}
 
 	stream.Sync(version);
@@ -1758,9 +1780,8 @@ void BSGeometryMeshData::GenerateMeshlets(uint32_t maxVerts, uint32_t maxPrims) 
 	nMeshlets = 0;
 	nCullData = 0;
 
-	if (tris.empty() || vertices.empty()) {
+	if (tris.empty() || vertices.empty())
 		return;
-	}
 
 	// A single triangle needs three distinct vertex slots; never go below that.
 	if (maxVerts < 3)
@@ -1780,11 +1801,12 @@ void BSGeometryMeshData::GenerateMeshlets(uint32_t maxVerts, uint32_t maxPrims) 
 		m.vertCount = static_cast<uint32_t>(cur.size());
 		m.vertOffset = vertOffsetAccum;
 		m.primCount = endTri - startTri;
-		m.primOffset = startTri;   // primOffset is in TRIANGLE units (matches vanilla SF meshlets)
+		m.primOffset = startTri * 3;   // primOffset is in index units (3 per triangle)
 		meshletList.push_back(m);
 		vertOffsetAccum += m.vertCount;
 
-		// Per-meshlet AABB over the meshlet's vertices. Stored in metric units (NIF units divided by havokScale), matching how the game decodes positions for culling.
+		// Per-meshlet AABB over the meshlet's vertices. Stored in metric units (NIF units
+		// divided by havokScale), matching how the game decodes positions for culling.
 		Vector3 mn(FLT_MAX, FLT_MAX, FLT_MAX);
 		Vector3 mx(-FLT_MAX, -FLT_MAX, -FLT_MAX);
 		for (uint16_t vi : cur) {
@@ -1810,7 +1832,8 @@ void BSGeometryMeshData::GenerateMeshlets(uint32_t maxVerts, uint32_t maxPrims) 
 		const Triangle& tri = tris[t];
 		const uint16_t tv[3] = {tri.p1, tri.p2, tri.p3};
 
-		// Count how many distinct vertices this triangle would add to the current meshlet, ignoring vertices already present and degenerate repeats within the triangle.
+		// Count how many distinct vertices this triangle would add to the current meshlet,
+		// ignoring vertices already present and degenerate repeats within the triangle.
 		uint32_t add = 0;
 		for (int a = 0; a < 3; a++) {
 			if (cur.count(tv[a]))
@@ -1839,6 +1862,246 @@ void BSGeometryMeshData::GenerateMeshlets(uint32_t maxVerts, uint32_t maxPrims) 
 	nMeshlets = static_cast<uint32_t>(meshletList.size());
 	nCullData = static_cast<uint32_t>(cullDataList.size());
 	version = 2;
+}
+
+void BSGeometryMeshData::FinalizeStarfield(const std::vector<Vector3>& srcTangents,
+										   const std::vector<Vector3>& srcBitangents,
+										   uint32_t weightsPerVert) {
+	version = 2;
+	nWeightsPerVert = weightsPerVert;
+
+	// Positions are packed as round(component / (scale * havokScale) * 32767), so scale must cover
+	// the largest |component| (in NIF units) or vertices clip. Use the metric extent with a small
+	// margin; clamp to a sane minimum so a degenerate/zero mesh still has scale > 0 (Sync requires it).
+	float maxAbs = 0.0f;
+	for (auto& v : vertices) {
+		maxAbs = std::max(maxAbs, std::fabs(v.x));
+		maxAbs = std::max(maxAbs, std::fabs(v.y));
+		maxAbs = std::max(maxAbs, std::fabs(v.z));
+	}
+	scale = (maxAbs / havokScale) * 1.0001f;
+	if (scale < 1.0e-4f)
+		scale = 1.0f;
+
+	// Store the tangent vectors and encode bitangent handedness in W: 1 when the source bitangent
+	// agrees with normal x tangent, else 0 (mirrors how the UDEC3 writer packs the top 2 bits).
+	tangents = srcTangents;
+	tangentWs.assign(tangents.size(), 1);
+	size_t n = std::min(tangents.size(), std::min(normals.size(), srcBitangents.size()));
+	for (size_t i = 0; i < n; i++) {
+		Vector3 expected = normals[i].cross(tangents[i]);
+		tangentWs[i] = (expected.dot(srcBitangents[i]) < 0.0f) ? 0 : 1;
+	}
+}
+
+void BSGeometryMeshData::notifyVerticesDelete(const std::vector<uint16_t>& vertIndices) {
+	std::vector<int> indexCollapse = GenerateIndexCollapseMap(vertIndices, vertices.size());
+
+	// Base class erases vertices, normals, tangents, bitangents, raw colors and UVs
+	NiGeometryData::notifyVerticesDelete(vertIndices);
+	nVertices = static_cast<uint32_t>(vertices.size());
+
+	if (!tangentWs.empty())
+		EraseVectorIndices(tangentWs, vertIndices);
+	if (!vColors.empty())
+		EraseVectorIndices(vColors, vertIndices);
+	if (!skinWeights.empty())
+		EraseVectorIndices(skinWeights, vertIndices);
+
+	ApplyMapToTriangles(tris, indexCollapse);
+	nTriIndices = static_cast<uint32_t>(tris.size()) * 3;
+
+	for (auto& lod : lods)
+		ApplyMapToTriangles(lod, indexCollapse);
+
+	// The meshlets and their 1:1 cull data index the previous triangle layout; drop them so the
+	// export/build paths rebuild them for the new geometry.
+	meshletList.clear();
+	cullDataList.clear();
+	nMeshlets = 0;
+	nCullData = 0;
+}
+
+void BSGeometryMeshData::RecalcNormals(const bool smooth, const float smoothThresh, std::unordered_set<uint32_t>* lockedIndices) {
+	if (vertices.empty() || tris.empty())
+		return;
+
+	SetNormals(true);
+	// SetNormals sizes by the 16-bit count and CalculateNormals keeps locked entries as-is,
+	// so make sure every vertex has an entry to keep.
+	normals.resize(vertices.size());
+
+	CalculateNormals(vertices, tris, normals, smooth, smoothThresh, lockedIndices);
+}
+
+void BSGeometryMeshData::CalcTangentSpace() {
+	const size_t numVerts = vertices.size();
+	if (numVerts == 0 || normals.size() != numVerts || uvSets.empty() || uvSets[0].size() != numVerts)
+		return;
+
+	SetTangents(true);
+
+	std::vector<Vector3> tan1(numVerts);
+	std::vector<Vector3> tan2(numVerts);
+
+	for (auto& triangle : tris) {
+		size_t i1 = triangle.p1;
+		size_t i2 = triangle.p2;
+		size_t i3 = triangle.p3;
+
+		if (i1 >= numVerts || i2 >= numVerts || i3 >= numVerts)
+			continue;
+
+		const Vector3& v1 = vertices[i1];
+		const Vector3& v2 = vertices[i2];
+		const Vector3& v3 = vertices[i3];
+
+		const Vector2& w1 = uvSets[0][i1];
+		const Vector2& w2 = uvSets[0][i2];
+		const Vector2& w3 = uvSets[0][i3];
+
+		float x1 = v2.x - v1.x;
+		float x2 = v3.x - v1.x;
+		float y1 = v2.y - v1.y;
+		float y2 = v3.y - v1.y;
+		float z1 = v2.z - v1.z;
+		float z2 = v3.z - v1.z;
+
+		float s1 = w2.u - w1.u;
+		float s2 = w3.u - w1.u;
+		float t1 = w2.v - w1.v;
+		float t2 = w3.v - w1.v;
+
+		float r = (s1 * t2 - s2 * t1);
+		r = (r >= 0.0f ? +1.0f : -1.0f);
+
+		Vector3 sdir = Vector3((t2 * x1 - t1 * x2) * r, (t2 * y1 - t1 * y2) * r, (t2 * z1 - t1 * z2) * r);
+		Vector3 tdir = Vector3((s1 * x2 - s2 * x1) * r, (s1 * y2 - s2 * y1) * r, (s1 * z2 - s2 * z1) * r);
+
+		sdir.Normalize();
+		tdir.Normalize();
+
+		tan1[i1] += tdir;
+		tan1[i2] += tdir;
+		tan1[i3] += tdir;
+
+		tan2[i1] += sdir;
+		tan2[i2] += sdir;
+		tan2[i3] += sdir;
+	}
+
+	tangents.resize(numVerts);
+	bitangents.resize(numVerts);
+	tangentWs.assign(numVerts, 1);
+
+	for (size_t i = 0; i < numVerts; i++) {
+		tangents[i] = tan1[i];
+		bitangents[i] = tan2[i];
+
+		if (tangents[i].IsZero() || bitangents[i].IsZero()) {
+			tangents[i].x = normals[i].y;
+			tangents[i].y = normals[i].z;
+			tangents[i].z = normals[i].x;
+			bitangents[i] = normals[i].cross(tangents[i]);
+		}
+		else {
+			tangents[i].Normalize();
+			tangents[i] = (tangents[i] - normals[i] * normals[i].dot(tangents[i]));
+			tangents[i].Normalize();
+
+			bitangents[i].Normalize();
+
+			bitangents[i] = (bitangents[i] - normals[i] * normals[i].dot(bitangents[i]));
+			bitangents[i] = (bitangents[i] - tangents[i] * tangents[i].dot(bitangents[i]));
+
+			bitangents[i].Normalize();
+		}
+
+		// W encodes bitangent handedness: 1 when the bitangent agrees with normal x tangent
+		Vector3 expected = normals[i].cross(tangents[i]);
+		tangentWs[i] = (expected.dot(bitangents[i]) < 0.0f) ? 0 : 1;
+	}
+}
+
+void BSGeometryMeshData::RecalcCullData() {
+	cullDataList.resize(meshletList.size());
+
+	for (size_t mi = 0; mi < meshletList.size(); mi++) {
+		const Meshlet& m = meshletList[mi];
+
+		// primOffset is in index units (3 per triangle)
+		size_t triStart = m.primOffset / 3;
+		size_t triEnd = triStart + m.primCount;
+		if (triEnd > tris.size())
+			triEnd = tris.size();
+
+		Vector3 mn(FLT_MAX, FLT_MAX, FLT_MAX);
+		Vector3 mx(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+		bool any = false;
+
+		for (size_t t = triStart; t < triEnd; t++) {
+			const Triangle& tri = tris[t];
+			const uint16_t tv[3] = {tri.p1, tri.p2, tri.p3};
+			for (uint16_t vi : tv) {
+				if (vi >= vertices.size())
+					continue;
+
+				const Vector3& p = vertices[vi];
+				mn.x = std::min(mn.x, p.x);
+				mn.y = std::min(mn.y, p.y);
+				mn.z = std::min(mn.z, p.z);
+				mx.x = std::max(mx.x, p.x);
+				mx.y = std::max(mx.y, p.y);
+				mx.z = std::max(mx.z, p.z);
+				any = true;
+			}
+		}
+
+		CullData& cd = cullDataList[mi];
+		if (!any) {
+			cd = CullData{};
+			continue;
+		}
+
+		// Stored in metric units (NIF units / havokScale), matching GenerateMeshlets
+		cd.center = Vector3((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f, (mn.z + mx.z) * 0.5f) / havokScale;
+		cd.expand = Vector3((mx.x - mn.x) * 0.5f, (mx.y - mn.y) * 0.5f, (mx.z - mn.z) * 0.5f) / havokScale;
+	}
+
+	nCullData = static_cast<uint32_t>(cullDataList.size());
+}
+
+std::vector<Color4>& BSGeometryMeshData::UpdateRawColors() {
+	vertexColors.resize(vColors.size());
+
+	for (size_t i = 0; i < vColors.size(); i++) {
+		vertexColors[i].r = vColors[i].r / 255.0f;
+		vertexColors[i].g = vColors[i].g / 255.0f;
+		vertexColors[i].b = vColors[i].b / 255.0f;
+		vertexColors[i].a = vColors[i].a / 255.0f;
+	}
+
+	return vertexColors;
+}
+
+void BSGeometryMeshData::SetColors(const std::vector<Color4>& colors) {
+	hasVertexColors = !colors.empty();
+	vertexColors = colors;
+
+	auto pack = [](float f) {
+		f = std::min(std::max(f, 0.0f), 1.0f);
+		return static_cast<uint8_t>(std::round(f * 255.0f));
+	};
+
+	vColors.resize(colors.size());
+	for (size_t i = 0; i < colors.size(); i++) {
+		vColors[i].r = pack(colors[i].r);
+		vColors[i].g = pack(colors[i].g);
+		vColors[i].b = pack(colors[i].b);
+		vColors[i].a = pack(colors[i].a);
+	}
+
+	nColors = static_cast<uint32_t>(vColors.size());
 }
 
 void BSGeometryMesh::Sync(NiStreamReversible& stream) {
@@ -1926,16 +2189,23 @@ void BSGeometry::SetTriangles(const std::vector<Triangle>& tris) {
 	if (meshes.size() > selectedMesh) {
 		auto& meshData = meshes[selectedMesh].meshData;
 
-		// Detect whether the triangle topology actually changes.
+		// Detect whether the triangle topology actually changes. SetTriangles is also called on
+		// non-editing paths (e.g. RemoveInvalidTris during load/save) that re-set an identical
+		// list; invalidating meshlets there would strip valid mesh-shader data from an unedited
+		// shape and break load->save byte stability.
 		bool changed = meshData.tris.size() != tris.size();
-		for (size_t i = 0; !changed && i < tris.size(); ++i) {
-			changed = meshData.tris[i].p1 != tris[i].p1 || meshData.tris[i].p2 != tris[i].p2 || meshData.tris[i].p3 != tris[i].p3;
-		}
+		for (size_t i = 0; !changed && i < tris.size(); ++i)
+			changed = meshData.tris[i].p1 != tris[i].p1 || meshData.tris[i].p2 != tris[i].p2
+				   || meshData.tris[i].p3 != tris[i].p3;
 
 		meshData.tris = tris;
 
-		//If triangles changed, we want to drop the meshlets so export re-generates them. (only want to strip on invalidation, not if no changes occured)
 		if (changed) {
+			// The mesh-shader meshlets and their 1:1 cull data index the previous triangle
+			// layout (primOffset/primCount/vertOffset). A changed triangle list invalidates
+			// them: shipping the stale meshlets makes the Starfield mesh-shader fetch
+			// out-of-range primitives, which renders as exploded geometry. Drop them so the
+			// export path (GenerateStarfieldMeshlets) rebuilds them to match the new geometry.
 			meshData.meshletList.clear();
 			meshData.cullDataList.clear();
 		}

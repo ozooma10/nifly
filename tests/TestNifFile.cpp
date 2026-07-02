@@ -6,6 +6,8 @@
 #include <NifFile.hpp>
 #include <NifUtil.hpp>
 
+#include <unordered_set>
+
 using namespace nifly;
 
 const std::string nifSuffix = ".nif";
@@ -470,6 +472,334 @@ TEST_CASE("Load external and save as internal mesh data (SF)", "[NifFile]") {
 	// Save again and verify binary stability
 	REQUIRE(nif2.Save(fileOutput) == 0);
 	REQUIRE(CompareBinaryFiles(fileOutput, fileExpected));
+}
+
+TEST_CASE("Generate meshlets (SF)", "[NifFile]") {
+	constexpr auto fileName = "TestNifFile_SF";
+	const auto fileInput = std::get<0>(GetFileTuple(fileName, nifSuffix));
+
+	NifFile nif;
+	REQUIRE(nif.Load(fileInput) == 0);
+
+	auto shapes = nif.GetShapes();
+	REQUIRE(!shapes.empty());
+
+	constexpr uint32_t kMaxVerts = 96;
+	constexpr uint32_t kMaxPrims = 128;
+
+	for (auto& s : shapes) {
+		auto* bsgeo = dynamic_cast<BSGeometry*>(s);
+		REQUIRE(bsgeo != nullptr);
+
+		auto meshPaths = nif.GetExternalGeometryPathRefs(s);
+		REQUIRE(!meshPaths.empty());
+
+		uint8_t meshIndex = 0;
+		for (auto meshPath : meshPaths) {
+			const auto meshFileInput = std::get<0>(GetFileTuple(meshPath.get().c_str(), meshSuffix));
+			auto meshStream = GetBinaryInputFileStream(std::filesystem::u8path(meshFileInput));
+			REQUIRE(meshStream);
+			REQUIRE(nif.LoadExternalShapeData(s, *meshStream, meshIndex));
+			meshStream.reset();
+			meshIndex++;
+		}
+
+		auto* md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData());
+		REQUIRE(md != nullptr);
+		REQUIRE(!md->tris.empty());
+		REQUIRE(!md->vertices.empty());
+
+		// Regenerate from scratch (mimics export of freshly authored geometry).
+		md->meshletList.clear();
+		md->cullDataList.clear();
+		md->GenerateMeshlets(kMaxVerts, kMaxPrims);
+
+		REQUIRE(!md->meshletList.empty());
+		REQUIRE(md->meshletList.size() == md->cullDataList.size());
+
+		uint32_t cumPrimOffset = 0;
+		uint32_t cumVertOffset = 0;
+		uint32_t coveredTris = 0;
+		const uint32_t vertCount = static_cast<uint32_t>(md->vertices.size());
+
+		for (const auto& m : md->meshletList) {
+			// Offsets are cumulative; primOffset is in index units (3 per triangle).
+			REQUIRE(m.primOffset == cumPrimOffset);
+			REQUIRE(m.vertOffset == cumVertOffset);
+			REQUIRE(m.primCount <= kMaxPrims);
+			REQUIRE(m.vertCount <= kMaxVerts);
+
+			// vertCount must equal the number of distinct vertices the meshlet's triangles touch.
+			std::unordered_set<uint16_t> distinct;
+			const uint32_t triStart = m.primOffset / 3;
+			for (uint32_t t = triStart; t < triStart + m.primCount; t++) {
+				REQUIRE(t < md->tris.size());
+				const Triangle& tri = md->tris[t];
+				REQUIRE(tri.p1 < vertCount);
+				REQUIRE(tri.p2 < vertCount);
+				REQUIRE(tri.p3 < vertCount);
+				distinct.insert(tri.p1);
+				distinct.insert(tri.p2);
+				distinct.insert(tri.p3);
+			}
+			REQUIRE(distinct.size() == m.vertCount);
+
+			cumPrimOffset += m.primCount * 3;
+			cumVertOffset += m.vertCount;
+			coveredTris += m.primCount;
+		}
+
+		// Every triangle is covered exactly once (contiguous partition of the whole list).
+		REQUIRE(coveredTris == md->tris.size());
+		REQUIRE(md->version == 2);
+	}
+}
+
+TEST_CASE("Editing triangles invalidates stale meshlets (SF)", "[NifFile]") {
+	// A BSGeometry's mesh-shader meshlets index a fixed triangle layout. Editing the triangle
+	// list (e.g. splitting/deleting verts in Outfit Studio) must drop the now-stale meshlets so
+	// the export path regenerates them; otherwise the game fetches out-of-range primitives and
+	// the mesh renders exploded. Re-setting an identical list must NOT touch meshlets, so
+	// non-editing passes (RemoveInvalidTris) keep load->save byte stability.
+	constexpr auto fileName = "TestNifFile_SF";
+	const auto fileInput = std::get<0>(GetFileTuple(fileName, nifSuffix));
+
+	NifFile nif;
+	REQUIRE(nif.Load(fileInput) == 0);
+
+	auto shapes = nif.GetShapes();
+	REQUIRE(!shapes.empty());
+
+	for (auto& s : shapes) {
+		auto* bsgeo = dynamic_cast<BSGeometry*>(s);
+		REQUIRE(bsgeo != nullptr);
+
+		auto meshPaths = nif.GetExternalGeometryPathRefs(s);
+		uint8_t meshIndex = 0;
+		for (auto meshPath : meshPaths) {
+			const auto meshFileInput = std::get<0>(GetFileTuple(meshPath.get().c_str(), meshSuffix));
+			auto meshStream = GetBinaryInputFileStream(std::filesystem::u8path(meshFileInput));
+			REQUIRE(meshStream);
+			REQUIRE(nif.LoadExternalShapeData(s, *meshStream, meshIndex));
+			meshStream.reset();
+			meshIndex++;
+		}
+
+		auto* md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData());
+		REQUIRE(md != nullptr);
+		REQUIRE(md->tris.size() > 1);
+
+		// Ensure meshlets exist regardless of whether the fixture ships them.
+		md->GenerateMeshlets();
+		REQUIRE(bsgeo->HasMeshlets());
+
+		std::vector<Triangle> tris;
+		REQUIRE(bsgeo->GetTriangles(tris));
+
+		// Identical triangle list -> meshlets preserved.
+		bsgeo->SetTriangles(tris);
+		REQUIRE(bsgeo->HasMeshlets());
+
+		// Changed triangle list (dropped a triangle) -> meshlets invalidated.
+		std::vector<Triangle> edited = tris;
+		edited.pop_back();
+		bsgeo->SetTriangles(edited);
+		REQUIRE_FALSE(bsgeo->HasMeshlets());
+	}
+}
+
+TEST_CASE("REPRO exploded mesh: edited BSGeometry ships consistent meshlets (SF)", "[NifFile][repro]") {
+	// Reproduces the in-game 'exploded mesh after an edit'. Delete a triangle, then run the
+	// export-time meshlet pass (regenerate only when missing, matching
+	// OutfitProject::GenerateStarfieldMeshlets). FIXED: SetTriangles drops the stale meshlets so
+	// they regenerate to the edited geometry. OLD: the shape ships meshlets that still index the
+	// pre-edit triangle layout, so the Starfield mesh-shader fetches out-of-range primitives ->
+	// exploded geometry. On old code the two REQUIREs below fail and the INFO lines show
+	// meshlets covering more triangles than exist.
+	constexpr auto fileName = "TestNifFile_SF";
+	const auto fileInput = std::get<0>(GetFileTuple(fileName, nifSuffix));
+
+	NifFile nif;
+	REQUIRE(nif.Load(fileInput) == 0);
+
+	for (auto& s : nif.GetShapes()) {
+		auto* bsgeo = dynamic_cast<BSGeometry*>(s);
+		REQUIRE(bsgeo != nullptr);
+
+		auto meshPaths = nif.GetExternalGeometryPathRefs(s);
+		uint8_t meshIndex = 0;
+		for (auto meshPath : meshPaths) {
+			const auto meshFileInput = std::get<0>(GetFileTuple(meshPath.get().c_str(), meshSuffix));
+			auto meshStream = GetBinaryInputFileStream(std::filesystem::u8path(meshFileInput));
+			REQUIRE(meshStream);
+			REQUIRE(nif.LoadExternalShapeData(s, *meshStream, meshIndex));
+			meshStream.reset();
+			meshIndex++;
+		}
+
+		auto* md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData());
+		REQUIRE(md != nullptr);
+		REQUIRE(md->tris.size() > 1);
+
+		md->GenerateMeshlets(); // start from a fully meshletted shape, like a loaded asset
+		REQUIRE(bsgeo->HasMeshlets());
+
+		// edit: delete one triangle (stand-in for a split / vertex delete)
+		std::vector<Triangle> tris;
+		REQUIRE(bsgeo->GetTriangles(tris));
+		tris.pop_back();
+		bsgeo->SetTriangles(tris);
+
+		// export-time meshlet pass: regenerate only if missing
+		if (!bsgeo->HasMeshlets())
+			bsgeo->GenerateMeshlets();
+
+		// verify the shipped meshlets match the edited geometry
+		md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData());
+		uint32_t coveredTris = 0;
+		uint32_t maxTriExclusive = 0;
+		for (const auto& m : md->meshletList) {
+			coveredTris += m.primCount;
+			maxTriExclusive = std::max(maxTriExclusive, (m.primOffset / 3) + m.primCount);
+		}
+		INFO("triangles after edit          = " << md->tris.size());
+		INFO("triangles covered by meshlets = " << coveredTris);
+		INFO("highest triangle index + 1    = " << maxTriExclusive);
+		REQUIRE(coveredTris == md->tris.size());
+		REQUIRE(maxTriExclusive <= md->tris.size());
+	}
+}
+
+TEST_CASE("REPRO exploded mesh: edited vertex survives internal round-trip (SF)", "[NifFile][repro]") {
+	// Reproduces the int16 position overflow. Move one vertex past the loaded quantization
+	// extent, save as internal geometry, reload. FIXED: Sync grows the per-mesh scale so the
+	// vertex packs without overflow and round-trips. OLD: the stale scale overflows the int16
+	// and the vertex decodes to a garbage position (a single far-flung spike in-game). On old
+	// code the final REQUIRE fails and the INFO lines show the round-tripped X far from target.
+	constexpr auto fileName = "TestNifFile_SF";
+	const auto fileInput = std::get<0>(GetFileTuple(fileName, nifSuffix));
+	const auto fileOutput = std::get<1>(GetFileTuple("REPRO_ScaleRoundTrip_SF", nifSuffix));
+
+	NifFile nif;
+	REQUIRE(nif.Load(fileInput) == 0);
+
+	auto shapes = nif.GetShapes();
+	REQUIRE(!shapes.empty());
+	auto* s = shapes.front();
+	auto* bsgeo = dynamic_cast<BSGeometry*>(s);
+	REQUIRE(bsgeo != nullptr);
+
+	auto meshPaths = nif.GetExternalGeometryPathRefs(s);
+	uint8_t meshIndex = 0;
+	for (auto meshPath : meshPaths) {
+		const auto meshFileInput = std::get<0>(GetFileTuple(meshPath.get().c_str(), meshSuffix));
+		auto meshStream = GetBinaryInputFileStream(std::filesystem::u8path(meshFileInput));
+		REQUIRE(meshStream);
+		REQUIRE(nif.LoadExternalShapeData(s, *meshStream, meshIndex));
+		meshStream.reset();
+		meshIndex++;
+	}
+	bsgeo->SetInternalGeomData(true);
+
+	auto* md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData());
+	REQUIRE(md != nullptr);
+	REQUIRE(!md->vertices.empty());
+
+	// Push one vertex well past the current extent (guaranteed to overflow a stale scale).
+	float maxAbs = 0.0f;
+	for (auto& v : md->vertices) {
+		maxAbs = std::max(maxAbs, std::fabs(v.x));
+		maxAbs = std::max(maxAbs, std::fabs(v.y));
+		maxAbs = std::max(maxAbs, std::fabs(v.z));
+	}
+	REQUIRE(maxAbs > 0.0f);
+	const Vector3 target(maxAbs * 3.0f, 0.0f, 0.0f);
+	md->vertices[0] = target;
+
+	REQUIRE(nif.Save(fileOutput) == 0);
+
+	NifFile nif2;
+	REQUIRE(nif2.Load(fileOutput) == 0);
+	auto* bsgeo2 = dynamic_cast<BSGeometry*>(nif2.GetShapes().front());
+	REQUIRE(bsgeo2 != nullptr);
+	auto* md2 = dynamic_cast<BSGeometryMeshData*>(bsgeo2->GetGeomData());
+	REQUIRE(md2 != nullptr);
+	REQUIRE(!md2->vertices.empty());
+	const Vector3 rt = md2->vertices[0];
+
+	INFO("moved vertex X target  = " << target.x);
+	INFO("round-tripped vertex X = " << rt.x);
+	// A small quantization error is expected; a stale-scale overflow misses by a huge margin.
+	REQUIRE(std::fabs(rt.x - target.x) < maxAbs * 0.05f);
+}
+
+TEST_CASE("Convert BSTriShape to BSGeometry (SF)", "[NifFile]") {
+	// A skinned Skyrim BSTriShape, reinterpreted into a Starfield-versioned file, must convert to a
+	// meshletted BSGeometry with its geometry and skinning preserved (the path used when exporting an
+	// imported Skyrim/FO mesh to Starfield).
+	constexpr auto fileName = "TestNifFile_Skinned_SE";
+	const auto fileInput = std::get<0>(GetFileTuple(fileName, nifSuffix));
+
+	NifFile nif;
+	REQUIRE(nif.Load(fileInput) == 0);
+	nif.GetHeader().SetVersion(NiVersion::getSF());
+	REQUIRE(nif.GetHeader().GetVersion().IsSF());
+
+	// Capture the source geometry/skin to compare after conversion.
+	struct Expect {
+		std::string name;
+		size_t verts = 0, tris = 0, bones = 0;
+		bool skinned = false;
+	};
+	std::vector<Expect> expected;
+	std::vector<NiShape*> toConvert;
+	for (auto& s : nif.GetShapes()) {
+		REQUIRE_FALSE(s->HasType<BSGeometry>());
+		Expect e;
+		e.name = s->name.get();
+		e.verts = s->GetNumVertices();
+		e.tris = s->GetNumTriangles();
+		e.skinned = s->IsSkinned();
+		std::vector<std::string> bones;
+		nif.GetShapeBoneList(s, bones);
+		e.bones = bones.size();
+		expected.push_back(e);
+		toConvert.push_back(s);
+	}
+	REQUIRE_FALSE(toConvert.empty());
+
+	for (auto* s : toConvert) {
+		NiShape* res = nif.ConvertShapeToBSGeometry(s);
+		REQUIRE(res != nullptr);
+		REQUIRE(res->HasType<BSGeometry>());
+	}
+
+	// Every shape is now a BSGeometry with meshlets, preserved geometry, and preserved skinning.
+	auto shapes = nif.GetShapes();
+	REQUIRE(shapes.size() == expected.size());
+	for (size_t i = 0; i < shapes.size(); i++) {
+		auto* bsgeo = dynamic_cast<BSGeometry*>(shapes[i]);
+		REQUIRE(bsgeo != nullptr);
+		REQUIRE(bsgeo->name.get() == expected[i].name);
+		REQUIRE(bsgeo->GetNumVertices() == expected[i].verts);
+
+		auto* md = dynamic_cast<BSGeometryMeshData*>(bsgeo->GetGeomData());
+		REQUIRE(md != nullptr);
+		REQUIRE(md->version == 2);
+		REQUIRE(md->tris.size() == expected[i].tris);
+		REQUIRE(md->scale > 0.0f);
+		REQUIRE_FALSE(md->meshletList.empty());
+		REQUIRE(md->meshletList.size() == md->cullDataList.size());
+
+		REQUIRE(bsgeo->IsSkinned() == expected[i].skinned);
+		if (expected[i].skinned) {
+			std::vector<std::string> bones;
+			nif.GetShapeBoneList(bsgeo, bones);
+			REQUIRE(bones.size() == expected[i].bones);
+			// Per-vertex weights were carried into the mesh data.
+			REQUIRE(md->skinWeights.size() == md->vertices.size());
+		}
+	}
 }
 
 TEST_CASE("FixBSXFlags (remove external emittance)", "[NifFile]") {

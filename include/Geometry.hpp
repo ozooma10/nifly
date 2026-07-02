@@ -609,7 +609,48 @@ public:
 
 	bool HasMeshlets() const { return !meshletList.empty(); }
 
-	void GenerateMeshlets(uint32_t maxVerts = 128, uint32_t maxPrims = 128);
+	// Starfield mesh-shader meshlet generation. Partitions the triangle list into contiguous
+	// runs ("meshlets"), each touching at most maxVerts distinct vertices and holding at most
+	// maxPrims triangles, then fills meshletList (vertCount = distinct verts, vertOffset =
+	// running vertCount sum, primCount = triangles, primOffset = running primCount*3 in index
+	// units) and the 1:1 cullDataList (per-meshlet AABB center/half-extent in metric units,
+	// i.e. NIF units / havokScale, matching how the game decodes positions). Triangle indices
+	// stay global into the unique vertex buffer and vertices are not reordered, so per-vertex
+	// data (normals/UVs/weights) is unaffected. Sets the mesh data version to 2. A Starfield
+	// BSGeometry with no meshlets renders invisible/garbled in-game, so this must run on any
+	// freshly authored geometry before export.
+	void GenerateMeshlets(uint32_t maxVerts = 96, uint32_t maxPrims = 128);
+
+	// After the base geometry (vertices + normals) is populated, set the Starfield-specific
+	// fields needed for a valid .mesh: the position quantization scale (derived from the vertex
+	// extent), the packed tangent list with per-tangent handedness W (from the source tangent/
+	// bitangent frames), the weights-per-vertex count, and format version 2. Used when building a
+	// BSGeometry from a converted Skyrim/FO shape.
+	void FinalizeStarfield(const std::vector<Vector3>& srcTangents,
+						   const std::vector<Vector3>& srcBitangents,
+						   uint32_t weightsPerVert);
+
+	// Removes the given vertices from every per-vertex stream this format carries beyond the
+	// NiGeometryData base (tangent handedness, byte colors, per-vertex skin weights), remaps or
+	// removes triangles (and LOD triangles) that referenced them, and drops the meshlets + cull
+	// data, which index the previous triangle layout and must be rebuilt before export.
+	void notifyVerticesDelete(const std::vector<uint16_t>& vertIndices) override;
+
+	void RecalcNormals(const bool smooth = true,
+					   const float smoothThres = 60.0f,
+					   std::unordered_set<uint32_t>* lockedIndices = nullptr) override;
+	void CalcTangentSpace() override;
+
+	// Recompute the per-meshlet cull AABBs from the current vertex positions while keeping the
+	// existing meshlet partition. Vertex position edits (sliders, brushes) don't invalidate the
+	// triangle partition, but they leave the stored cull boxes describing the old positions,
+	// which makes the game cull meshlets that should be visible.
+	void RecalcCullData();
+
+	// Unpack the file-backed byte colors into the inherited raw Color4 list and return it.
+	std::vector<Color4>& UpdateRawColors();
+	// Store colors into the file-backed byte color list (and the raw mirror).
+	void SetColors(const std::vector<Color4>& colors);
 };
 
 struct BSGeometryMesh {
@@ -656,6 +697,13 @@ public:
 	bool GetTriangles(std::vector<Triangle>& tris) const override;
 	void SetTriangles(const std::vector<Triangle>& tris) override;
 
+	// Block-level bounds (separate from geom-data bounds). Vanilla SF ships boundMinMax as FLT_MAX
+	// (no box-cull) and relies on per-meshlet cull data; a zero box culls the shape everywhere.
+	BoundingSphere GetBlockBounds() const { return bounds; }
+	void SetBlockBounds(const BoundingSphere& b) { bounds = b; }
+	void GetBoundMinMax(float out[6]) const { for (int i = 0; i < 6; i++) out[i] = boundMinMax[i]; }
+	void SetBoundMinMax(const float in[6]) { for (int i = 0; i < 6; i++) boundMinMax[i] = in[i]; }
+
 	bool IsSkinned() const override { return !skinInstanceRef.IsEmpty(); }
 
 	bool HasSkinInstance() const override { return !skinInstanceRef.IsEmpty(); }
@@ -672,23 +720,27 @@ public:
 
 	uint8_t MeshCount() { return (uint8_t) meshes.size();	}
 
+	// Append an empty mesh slot, select it, and return it. Used when building a BSGeometry
+	// from scratch (e.g. converting a BSTriShape), since loaded shapes get their slots from Sync.
 	BSGeometryMesh* AddMesh() {
 		meshes.emplace_back();
 		selectedMesh = static_cast<uint8_t>(meshes.size() - 1);
 		return &meshes.back();
 	}
 
+	// True if any mesh slot already carries mesh-shader meshlets.
 	bool HasMeshlets() const {
-		for (auto& mesh : meshes) {
-			if(mesh.meshData.HasMeshlets()) {
+		for (auto& mesh : meshes)
+			if (mesh.meshData.HasMeshlets())
 				return true;
-			}
-		}
 		return false;
 	}
 
-	// Generate Starfield mesh-shader meshlets + cull data for every mesh slot that has triangle data. 
-	void GenerateMeshlets(uint32_t maxVerts = 128, uint32_t maxPrims = 128, bool onlyIfMissing = true) {
+	// Generate Starfield mesh-shader meshlets + cull data for every mesh slot that has
+	// triangle data. When onlyIfMissing is true (the default) slots that already carry
+	// meshlets are left untouched, so a load->save round-trip of an existing mesh stays
+	// byte-identical while freshly authored geometry (meshlets cleared) gets new ones.
+	void GenerateMeshlets(uint32_t maxVerts = 96, uint32_t maxPrims = 128, bool onlyIfMissing = true) {
 		for (auto& mesh : meshes) {
 			if (onlyIfMissing && mesh.meshData.HasMeshlets())
 				continue;
@@ -696,6 +748,14 @@ public:
 				continue;
 			mesh.meshData.GenerateMeshlets(maxVerts, maxPrims);
 		}
+	}
+
+	// Refresh the per-meshlet cull AABBs of every mesh slot to match the current vertex
+	// positions, keeping the meshlet partitions. Needed after position-only edits (sliders,
+	// brushes), which don't drop the meshlets but leave their cull boxes stale.
+	void RecalcCullData() {
+		for (auto& mesh : meshes)
+			mesh.meshData.RecalcCullData();
 	}
 
 	// Flag 0x200 (512) on BSGeometry controls whether mesh data is embedded inline
